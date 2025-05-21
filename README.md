@@ -1,4 +1,4 @@
-# da6401_assignment_3
+# DA6401_assignment_3
 
 # Sequence-to-Sequence Transliteration for Indian Languages (DA6401 Assignment 3)
 
