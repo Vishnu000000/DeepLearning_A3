@@ -1,95 +1,213 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import math
 
-class SeqEncoder(nn.Module):
-    def __init__(self, vocab_dim, emb_dim, hid_dim, 
-                 layers=1, rnn_type='lstm', drop=0.3):
+class NeuralEncoder(nn.Module):
+    """Neural encoder with attention"""
+    def __init__(self, vocab_size, embed_dim, hidden_dim, num_layers=1, rnn_type='lstm', dropout=0.3):
         super().__init__()
-        self.emb = nn.Embedding(vocab_dim, emb_dim)
-        self.rnn = getattr(nn, rnn_type.upper())(
-            emb_dim, hid_dim, layers,
-            dropout=drop if layers>1 else 0,
-            batch_first=True
+        self.embedding = nn.Embedding(vocab_size, embed_dim)
+        self.position_encoding = PositionalEncoding(embed_dim)
+        
+        # RNN layer
+        rnn_class = getattr(nn, rnn_type.upper())
+        self.rnn = rnn_class(
+            input_size=embed_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            dropout=dropout if num_layers > 1 else 0,
+            batch_first=True,
+            bidirectional=True
         )
         
-    def encode(self, x):
-        emb = self.emb(x)
-        return self.rnn(emb)
+        # Output processing
+        self.output_proj = nn.Linear(hidden_dim * 2, hidden_dim)
+        self.layer_norm = nn.LayerNorm(hidden_dim)
+        
+    def forward(self, x):
+        # Embed and add positional encoding
+        embedded = self.embedding(x)
+        embedded = self.position_encoding(embedded)
+        
+        # Process through RNN
+        outputs, hidden = self.rnn(embedded)
+        
+        # Project and normalize
+        outputs = self.output_proj(outputs)
+        outputs = self.layer_norm(outputs)
+        
+        return outputs, hidden
 
-class FocusMechanism(nn.Module):
-    def __init__(self, hid_dim, mode='dot', drop=0.1):
+class PositionalEncoding(nn.Module):
+    """Positional encoding for sequence data"""
+    def __init__(self, dim, max_len=5000):
         super().__init__()
-        self.mode = mode
-        if mode == 'general':
-            self.proj = nn.Linear(hid_dim, hid_dim)
-        elif mode == 'concat':
-            self.proj = nn.Linear(hid_dim*2, hid_dim)
-            self.v = nn.Parameter(torch.rand(hid_dim))
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, dim, 2) * (-math.log(10000.0) / dim))
+        pe = torch.zeros(max_len, 1, dim)
+        pe[:, 0, 0::2] = torch.sin(position * div_term)
+        pe[:, 0, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
+    
+    def forward(self, x):
+        return x + self.pe[:x.size(1)]
+
+class AdaptiveAttention(nn.Module):
+    """Adaptive attention mechanism"""
+    def __init__(self, hidden_dim, num_heads=4, dropout=0.1):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
         
-        self.drop = nn.Dropout(drop)
+        # Attention projections
+        self.query_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.key_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.value_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.output_proj = nn.Linear(hidden_dim, hidden_dim)
         
-    def compute(self, dec_hid, enc_outs, mask=None):
-        if self.mode == 'dot':
-            scores = torch.bmm(enc_outs, dec_hid.unsqueeze(2)).squeeze(2)
-        elif self.mode == 'general':
-            scores = torch.bmm(self.proj(enc_outs), dec_hid.unsqueeze(2)).squeeze(2)
-        elif self.mode == 'concat':
-            expanded = dec_hid.unsqueeze(1).expand_as(enc_outs)
-            combined = torch.tanh(self.proj(torch.cat((enc_outs, expanded), 2)))
-            scores = torch.matmul(combined, self.v)
-            
+        # Attention scoring
+        self.score_weights = nn.Parameter(torch.ones(3))
+        self.dropout = nn.Dropout(dropout)
+        
+    def compute_attention(self, query, key, value, mask=None):
+        batch_size = query.size(0)
+        
+        # Project inputs
+        q = self.query_proj(query).view(batch_size, -1, self.num_heads, self.head_dim)
+        k = self.key_proj(key).view(batch_size, -1, self.num_heads, self.head_dim)
+        v = self.value_proj(value).view(batch_size, -1, self.num_heads, self.head_dim)
+        
+        # Compute attention scores
+        dot_product = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        cosine_sim = F.cosine_similarity(q.unsqueeze(-2), k.unsqueeze(-3), dim=-1)
+        distance = -torch.cdist(q, k)
+        
+        # Combine scores
+        weights = F.softmax(self.score_weights, 0)
+        scores = weights[0] * dot_product + weights[1] * cosine_sim + weights[2] * distance
+        
+        # Apply mask if provided
         if mask is not None:
-            scores = scores.masked_fill(mask==0, -1e9)
-            
-        attn = self.drop(torch.softmax(scores, 1))
-        ctx = torch.bmm(attn.unsqueeze(1), enc_outs).squeeze(1)
-        return attn, ctx
+            scores = scores.masked_fill(~mask, -1e9)
+        
+        # Compute attention weights
+        attention = F.softmax(scores, -1)
+        attention = self.dropout(attention)
+        
+        # Compute output
+        output = torch.matmul(attention, v)
+        output = output.transpose(1, 2).contiguous().view(batch_size, -1, self.hidden_dim)
+        return self.output_proj(output), attention
 
-class AttnDecoder(nn.Module):
-    def __init__(self, vocab_dim, emb_dim, hid_dim, 
-                 layers=1, rnn_type='lstm', drop=0.3, 
-                 attn_mode='dot'):
+class NeuralDecoder(nn.Module):
+    """Neural decoder with attention"""
+    def __init__(self, vocab_size, embed_dim, hidden_dim, num_layers=1, rnn_type='lstm', dropout=0.3):
         super().__init__()
-        self.emb = nn.Embedding(vocab_dim, emb_dim)
-        self.attn = FocusMechanism(hid_dim, attn_mode, drop)
-        self.rnn = getattr(nn, rnn_type.upper())(
-            emb_dim + hid_dim, hid_dim, layers,
-            dropout=drop if layers>1 else 0,
+        self.embedding = nn.Embedding(vocab_size, embed_dim)
+        self.position_encoding = PositionalEncoding(embed_dim)
+        
+        # Attention mechanism
+        self.attention = AdaptiveAttention(hidden_dim)
+        
+        # RNN layer
+        rnn_class = getattr(nn, rnn_type.upper())
+        self.rnn = rnn_class(
+            input_size=embed_dim + hidden_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            dropout=dropout if num_layers > 1 else 0,
             batch_first=True
         )
-        self.out = nn.Linear(hid_dim*2, vocab_dim)
         
-    def step(self, x, hid, enc_outs, mask=None):
-        emb = self.emb(x.unsqueeze(1))
-        attn, ctx = self.attn.compute(hid[-1], enc_outs, mask)
-        rnn_in = torch.cat([emb, ctx.unsqueeze(1)], 2)
-        out, new_hid = self.rnn(rnn_in, hid)
-        return self.out(torch.cat([out.squeeze(1), ctx], 1)), new_hid, attn
+        # Output processing
+        self.output_processor = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, vocab_size)
+        )
+        
+    def decode_step(self, x, memory, hidden, mask=None):
+        # Embed and add positional encoding
+        embedded = self.embedding(x)
+        embedded = self.position_encoding(embedded)
+        
+        # Compute attention
+        context, attention_weights = self.attention.compute_attention(
+            hidden[-1].unsqueeze(1), memory, memory, mask
+        )
+        
+        # Combine features
+        combined = torch.cat([embedded, context], -1)
+        
+        # Process through RNN
+        output, new_hidden = self.rnn(combined, hidden)
+        
+        # Generate output
+        output = self.output_processor(torch.cat([output, context], -1))
+        
+        return output, attention_weights, new_hidden
 
-class AttnSeqModel(nn.Module):
-    def __init__(self, enc, dec, device):
+class NeuralTranslator(nn.Module):
+    """Neural sequence-to-sequence translator"""
+    def __init__(self, config):
         super().__init__()
-        self.enc = enc
-        self.dec = dec
-        self.dev = device
+        self.encoder = NeuralEncoder(
+            vocab_size=config.input_size,
+            embed_dim=config.embed_dim,
+            hidden_dim=config.hidden_dim,
+            num_layers=config.num_layers,
+            dropout=config.dropout
+        )
         
-    def process(self, src, tgt=None, max_len=50, teach_prob=0.5):
+        self.decoder = NeuralDecoder(
+            vocab_size=config.output_size,
+            embed_dim=config.embed_dim,
+            hidden_dim=config.hidden_dim,
+            num_layers=config.num_layers,
+            dropout=config.dropout
+        )
+        
+        self.config = config
+        
+    def forward(self, source, target, source_mask=None):
+        # Encode source sequence
+        encoded, encoder_hidden = self.encoder(source)
+        
+        # Decode target sequence
+        decoded, attention_weights, _ = self.decoder.decode_step(
+            target, encoded, encoder_hidden, source_mask
+        )
+        
+        return decoded, attention_weights
+        
+    def predict(self, source, max_length, device):
+        batch_size = source.size(0)
+        
+        # Encode source sequence
+        encoded, encoder_hidden = self.encoder(source)
+        
+        # Initialize generation
+        tokens = torch.ones(batch_size, 1, dtype=torch.long, device=device)
         outputs = []
-        attns = []
         
-        enc_outs, hid = self.enc.encode(src)
-        dec_in = src[:,0] if tgt is None else tgt[:,0]
-        
-        for t in range(max_len if tgt is None else tgt.size(1)):
-            pred, hid, attn = self.dec.step(dec_in, hid, enc_outs)
-            outputs.append(pred)
-            attns.append(attn)
+        # Generate sequence
+        for _ in range(max_length):
+            # Decode step
+            logits, attention, encoder_hidden = self.decoder.decode_step(
+                tokens[:, -1:], encoded, encoder_hidden
+            )
             
-            if tgt is not None and random.random() < teach_prob:
-                dec_in = tgt[:,t]
-            else:
-                dec_in = pred.argmax(1)
-                
-            if (dec_in == 2).all() and tgt is None: break
-                
-        return torch.stack(outputs, 1), torch.stack(attns, 1)
+            # Get next token
+            next_token = logits.argmax(-1)
+            tokens = torch.cat([tokens, next_token], -1)
+            outputs.append(logits)
+            
+            # Check for end token
+            if (next_token == 2).all():
+                break
+        
+        return torch.cat(outputs, 1), tokens

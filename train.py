@@ -1,174 +1,299 @@
 import torch
 import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
 import wandb
-import argparse
 import logging
 from pathlib import Path
-from typing import Optional, Dict, Any
-import random
 import numpy as np
+from tqdm import tqdm
 
-from models import HybridSeq2Seq
-from data_utils import (
-    TextPreprocessor,
-    DataAugmenter,
-    create_dataloaders
+from models import ModelConfig, NeuralTranslator
+from data_utils import BilingualPairDataset, CharacterMapper
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
-from train_utils import (
-    TrainingConfig,
-    ModelTrainer,
-    ModelEvaluator
-)
+logger = logging.getLogger('neural_translator')
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+class TrainingConfig:
+    """Configuration class for training parameters"""
+    def __init__(self, **kwargs):
+        self.embed_dim = kwargs.get('embed_dim', 256)
+        self.hidden_dim = kwargs.get('hidden_dim', 512)
+        self.num_layers = kwargs.get('num_layers', 2)
+        self.dropout = kwargs.get('dropout', 0.3)
+        self.learning_rate = kwargs.get('learning_rate', 0.001)
+        self.batch_size = kwargs.get('batch_size', 32)
+        self.epochs = kwargs.get('epochs', 20)
+        self.max_length = kwargs.get('max_length', 100)
+        self.min_freq = kwargs.get('min_freq', 1)
+        self.use_wandb = kwargs.get('use_wandb', False)
+        self.save_dir = kwargs.get('save_dir', 'checkpoints')
+        self.seed = kwargs.get('seed', 42)
 
-def parse_args():
-    parser = argparse.ArgumentParser(description='Train a hybrid CNN-LSTM model for transliteration')
+class TrainingManager:
+    """Manages the training process"""
+    def __init__(self, config):
+        self.config = config
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.setup_seeds()
+        self.setup_directories()
+        
+    def setup_seeds(self):
+        """Set random seeds for reproducibility"""
+        torch.manual_seed(self.config.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(self.config.seed)
+        np.random.seed(self.config.seed)
     
-    # Data arguments
-    parser.add_argument('--train_file', type=str, required=True, help='Path to training data')
-    parser.add_argument('--val_file', type=str, required=True, help='Path to validation data')
-    parser.add_argument('--test_file', type=str, required=True, help='Path to test data')
+    def setup_directories(self):
+        """Create necessary directories"""
+        self.save_path = Path(self.config.save_dir)
+        self.save_path.mkdir(parents=True, exist_ok=True)
     
-    # Model arguments
-    parser.add_argument('--embed_dim', type=int, default=256, help='Embedding dimension')
-    parser.add_argument('--hidden_dim', type=int, default=512, help='Hidden dimension')
-    parser.add_argument('--num_blocks', type=int, default=3, help='Number of CNN blocks')
-    parser.add_argument('--num_layers', type=int, default=2, help='Number of LSTM layers')
-    parser.add_argument('--num_heads', type=int, default=8, help='Number of attention heads')
-    parser.add_argument('--dropout', type=float, default=0.1, help='Dropout rate')
-    
-    # Training arguments
-    parser.add_argument('--batch_size', type=int, default=32, help='Batch size')
-    parser.add_argument('--num_epochs', type=int, default=100, help='Number of epochs')
-    parser.add_argument('--max_lr', type=float, default=1e-3, help='Maximum learning rate')
-    parser.add_argument('--max_len', type=int, default=50, help='Maximum sequence length')
-    parser.add_argument('--min_freq', type=int, default=2, help='Minimum token frequency')
-    parser.add_argument('--max_vocab_size', type=int, default=None, help='Maximum vocabulary size')
-    parser.add_argument('--gradient_clip_val', type=float, default=1.0, help='Gradient clipping value')
-    parser.add_argument('--gradient_accumulation_steps', type=int, default=1, help='Gradient accumulation steps')
-    parser.add_argument('--label_smoothing', type=float, default=0.1, help='Label smoothing factor')
-    parser.add_argument('--teacher_forcing_ratio', type=float, default=0.5, help='Teacher forcing ratio')
-    
-    # Data augmentation arguments
-    parser.add_argument('--noise_prob', type=float, default=0.1, help='Probability of adding noise')
-    parser.add_argument('--swap_prob', type=float, default=0.1, help='Probability of swapping characters')
-    parser.add_argument('--delete_prob', type=float, default=0.1, help='Probability of deleting characters')
-    
-    # Wandb arguments
-    parser.add_argument('--wandb_project', type=str, default=None, help='Wandb project name')
-    parser.add_argument('--wandb_entity', type=str, default=None, help='Wandb entity name')
-    parser.add_argument('--wandb_name', type=str, default=None, help='Wandb run name')
-    
-    # Other arguments
-    parser.add_argument('--save_dir', type=str, default='checkpoints', help='Directory to save checkpoints')
-    parser.add_argument('--seed', type=int, default=42, help='Random seed')
-    parser.add_argument('--num_workers', type=int, default=4, help='Number of data loading workers')
-    
-    return parser.parse_args()
+    def setup_wandb(self):
+        """Initialize Weights & Biases"""
+        if self.config.use_wandb:
+            wandb.init(
+                project="neural-translator",
+                config=vars(self.config)
+            )
 
-def set_seed(seed: int):
-    """Set random seed for reproducibility."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-def main():
-    # Parse arguments
-    args = parse_args()
+class DataManager:
+    """Manages data loading and preprocessing"""
+    def __init__(self, config, device):
+        self.config = config
+        self.device = device
+        self.source_mapper = CharacterMapper()
+        self.target_mapper = CharacterMapper()
     
-    # Set random seed
-    set_seed(args.seed)
-    
-    # Set device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    logger.info(f"Using device: {device}")
-    
-    # Create save directory
-    save_dir = Path(args.save_dir)
-    save_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Initialize wandb if project name is provided
-    if args.wandb_project:
-        wandb.init(
-            project=args.wandb_project,
-            entity=args.wandb_entity,
-            name=args.wandb_name,
-            config=vars(args)
+    def load_data(self, train_path, val_path, test_path):
+        """Load and prepare datasets"""
+        # Create datasets
+        train_dataset = BilingualPairDataset(
+            train_path, self.source_mapper, self.target_mapper
         )
+        val_dataset = BilingualPairDataset(
+            val_path, self.source_mapper, self.target_mapper
+        )
+        test_dataset = BilingualPairDataset(
+            test_path, self.source_mapper, self.target_mapper
+        )
+        
+        # Create data loaders
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=self.config.batch_size,
+            shuffle=True,
+            num_workers=4,
+            pin_memory=True
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=self.config.batch_size,
+            num_workers=4,
+            pin_memory=True
+        )
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=self.config.batch_size,
+            num_workers=4,
+            pin_memory=True
+        )
+        
+        return train_loader, val_loader, test_loader
+
+class ModelManager:
+    """Manages model creation and training"""
+    def __init__(self, config, device):
+        self.config = config
+        self.device = device
     
-    # Initialize preprocessor and augmenter
-    preprocessor = TextPreprocessor(
-        lowercase=True,
-        remove_punctuation=True,
-        normalize_unicode=True
+    def create_model(self, source_vocab_size, target_vocab_size):
+        """Create and initialize the model"""
+        model_config = ModelConfig(
+            input_size=source_vocab_size,
+            output_size=target_vocab_size,
+            embed_dim=self.config.embed_dim,
+            hidden_dim=self.config.hidden_dim,
+            num_layers=self.config.num_layers,
+            dropout=self.config.dropout
+        )
+        
+        model = NeuralTranslator(model_config).to(self.device)
+        return model
+    
+    def create_optimizer(self, model):
+        """Create optimizer and learning rate scheduler"""
+        optimizer = optim.AdamW(
+            model.parameters(),
+            lr=self.config.learning_rate,
+            weight_decay=0.01
+        )
+        
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode='min',
+            factor=0.5,
+            patience=2,
+            verbose=True
+        )
+        
+        return optimizer, scheduler
+
+class Trainer:
+    """Handles the training process"""
+    def __init__(self, model, optimizer, scheduler, criterion, device):
+        self.model = model
+        self.optimizer = optimizer
+        self.scheduler = scheduler
+        self.criterion = criterion
+        self.device = device
+    
+    def train_epoch(self, train_loader):
+        """Train for one epoch"""
+        self.model.train()
+        total_loss = 0
+        
+        for source_batch, target_batch in tqdm(train_loader, desc="Training"):
+            source_batch = source_batch.to(self.device)
+            target_batch = target_batch.to(self.device)
+            
+            self.optimizer.zero_grad()
+            predictions, _ = self.model(source_batch, target_batch)
+            
+            # Reshape for loss calculation
+            batch_size, seq_len, vocab_size = predictions.shape
+            predictions = predictions[:, 1:].contiguous().view(-1, vocab_size)
+            targets = target_batch[:, 1:].contiguous().view(-1)
+            
+            loss = self.criterion(predictions, targets)
+            loss.backward()
+            
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            
+            self.optimizer.step()
+            total_loss += loss.item()
+        
+        return total_loss / len(train_loader)
+    
+    def evaluate(self, data_loader):
+        """Evaluate the model"""
+        self.model.eval()
+        total_loss = 0
+        
+        with torch.no_grad():
+            for source_batch, target_batch in tqdm(data_loader, desc="Evaluating"):
+                source_batch = source_batch.to(self.device)
+                target_batch = target_batch.to(self.device)
+                
+                predictions, _ = self.model(source_batch, target_batch)
+                batch_size, seq_len, vocab_size = predictions.shape
+                predictions = predictions[:, 1:].contiguous().view(-1, vocab_size)
+                targets = target_batch[:, 1:].contiguous().view(-1)
+                
+                loss = self.criterion(predictions, targets)
+                total_loss += loss.item()
+        
+        return total_loss / len(data_loader)
+
+def train_model(config, train_path, val_path, test_path):
+    """Main training function"""
+    # Initialize managers
+    training_manager = TrainingManager(config)
+    training_manager.setup_wandb()
+    
+    data_manager = DataManager(config, training_manager.device)
+    train_loader, val_loader, test_loader = data_manager.load_data(
+        train_path, val_path, test_path
     )
     
-    augmenter = DataAugmenter(
-        noise_prob=args.noise_prob,
-        swap_prob=args.swap_prob,
-        delete_prob=args.delete_prob
+    model_manager = ModelManager(config, training_manager.device)
+    model = model_manager.create_model(
+        data_manager.source_mapper.vocab_size,
+        data_manager.target_mapper.vocab_size
     )
     
-    # Create data loaders
-    train_loader, val_loader, test_loader, source_vocab, target_vocab = create_dataloaders(
-        train_file=args.train_file,
-        val_file=args.val_file,
-        test_file=args.test_file,
-        batch_size=args.batch_size,
-        max_len=args.max_len,
-        min_freq=args.min_freq,
-        max_vocab_size=args.max_vocab_size,
-        num_workers=args.num_workers,
-        preprocessor=preprocessor,
-        augmenter=augmenter
-    )
+    optimizer, scheduler = model_manager.create_optimizer(model)
+    criterion = nn.CrossEntropyLoss(ignore_index=0)
     
-    # Initialize model
-    model = HybridSeq2Seq(
-        source_vocab_size=len(source_vocab),
-        target_vocab_size=len(target_vocab),
-        embed_dim=args.embed_dim,
-        hidden_dim=args.hidden_dim,
-        device=device
-    ).to(device)
+    trainer = Trainer(model, optimizer, scheduler, criterion, training_manager.device)
     
-    # Initialize training config
-    train_config = TrainingConfig(
-        max_lr=args.max_lr,
-        gradient_clip_val=args.gradient_clip_val,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        label_smoothing=args.label_smoothing
-    )
+    # Training loop
+    best_val_loss = float('inf')
+    patience = 5
+    patience_counter = 0
     
-    # Initialize trainer
-    trainer = ModelTrainer(
-        model=model,
-        device=device,
-        config=train_config
-    )
+    for epoch in range(config.epochs):
+        logger.info(f"Epoch {epoch+1}/{config.epochs}")
+        
+        # Training phase
+        train_loss = trainer.train_epoch(train_loader)
+        
+        # Validation phase
+        val_loss = trainer.evaluate(val_loader)
+        
+        # Update learning rate
+        scheduler.step(val_loss)
+        
+        # Log metrics
+        metrics = {
+            'epoch': epoch + 1,
+            'train_loss': train_loss,
+            'val_loss': val_loss,
+            'learning_rate': optimizer.param_groups[0]['lr']
+        }
+        logger.info(f"Train Loss: {train_loss:.4f}")
+        logger.info(f"Val Loss: {val_loss:.4f}")
+        
+        if config.use_wandb:
+            wandb.log(metrics)
+        
+        # Save best model
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            torch.save(model.state_dict(), training_manager.save_path / 'best_model.pt')
+            logger.info("Saved best model!")
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                logger.info("Early stopping triggered!")
+                break
     
-    # Train model
-    training_history = trainer.train(
-        train_loader=train_loader,
-        val_loader=val_loader,
-        num_epochs=args.num_epochs,
-        save_path=save_dir / 'best_model.pt',
-        wandb_config=wandb.run.config if wandb.run else None
-    )
+    # Final evaluation
+    model.load_state_dict(torch.load(training_manager.save_path / 'best_model.pt'))
+    test_loss = trainer.evaluate(test_loader)
+    logger.info(f"Final Test Loss: {test_loss:.4f}")
     
-    # Evaluate on test set
-    evaluator = ModelEvaluator(model, device, target_vocab)
-    test_accuracy = evaluator.calculate_accuracy(test_loader)
-    logger.info(f"Test Accuracy: {test_accuracy:.4f}")
-    
-    if wandb.run:
-        wandb.log({'test_accuracy': test_accuracy})
+    if config.use_wandb:
+        wandb.log({"test_loss": test_loss})
         wandb.finish()
 
 if __name__ == '__main__':
-    main() 
+    # Example configuration
+    config = TrainingConfig(
+        embed_dim=256,
+        hidden_dim=512,
+        num_layers=2,
+        dropout=0.3,
+        learning_rate=0.001,
+        batch_size=32,
+        epochs=20,
+        max_length=100,
+        min_freq=1,
+        use_wandb=True,
+        save_dir='checkpoints',
+        seed=42
+    )
+    
+    # Example paths
+    train_path = 'data/train.txt'
+    val_path = 'data/val.txt'
+    test_path = 'data/test.txt'
+    
+    train_model(config, train_path, val_path, test_path) 
