@@ -3,93 +3,161 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from typing import Optional, Tuple, Dict, List
+from dataclasses import dataclass
+
+@dataclass
+class ModelConfig:
+    """Configuration for the neural transliteration model"""
+    input_dim: int
+    output_dim: int
+    hidden_dim: int = 512
+    num_layers: int = 3
+    dropout: float = 0.2
+    attention_heads: int = 4
+    use_layer_norm: bool = True
+    use_residual: bool = True
+    max_sequence_length: int = 100
+    use_convolution: bool = True
+    use_transformer: bool = True
+    use_lstm: bool = True
 
 class MultiScaleEncoder(nn.Module):
     """Multi-scale encoder with dynamic feature extraction"""
-    def __init__(self, 
-                 input_dim: int,
-                 hidden_dim: int,
-                 num_layers: int = 2,
-                 dropout: float = 0.1):
+    def __init__(self, config: ModelConfig):
         super().__init__()
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
+        self.config = config
+        
+        # Character embedding with position encoding
+        self.char_embedding = nn.Embedding(config.input_dim, config.hidden_dim)
+        self.pos_encoding = PositionalEncoding(config.hidden_dim, config.max_sequence_length)
         
         # Multi-scale feature extraction
-        self.scale_embeddings = nn.ModuleList([
-            nn.Linear(input_dim, hidden_dim // 2),
-            nn.Linear(input_dim, hidden_dim // 4),
-            nn.Linear(input_dim, hidden_dim // 8)
+        self.conv_layers = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv1d(config.hidden_dim, config.hidden_dim // 2, kernel_size=k),
+                nn.BatchNorm1d(config.hidden_dim // 2),
+                nn.ReLU(),
+                nn.Dropout(config.dropout)
+            ) for k in [2, 3, 4]
         ])
         
-        # Dynamic feature fusion
-        self.fusion_weights = nn.Parameter(torch.ones(3) / 3)
+        # Feature fusion with attention
+        self.fusion_attention = nn.MultiheadAttention(
+            config.hidden_dim // 2,
+            num_heads=config.attention_heads,
+            dropout=config.dropout
+        )
         
         # Bidirectional processing
-        self.forward_gru = nn.GRU(
-            hidden_dim, hidden_dim // 2,
-            num_layers=num_layers,
-            dropout=dropout if num_layers > 1 else 0,
+        self.forward_lstm = nn.LSTM(
+            config.hidden_dim, config.hidden_dim // 2,
+            num_layers=config.num_layers,
+            dropout=config.dropout if config.num_layers > 1 else 0,
             batch_first=True
         )
-        self.backward_gru = nn.GRU(
-            hidden_dim, hidden_dim // 2,
-            num_layers=num_layers,
-            dropout=dropout if num_layers > 1 else 0,
+        self.backward_lstm = nn.LSTM(
+            config.hidden_dim, config.hidden_dim // 2,
+            num_layers=config.num_layers,
+            dropout=config.dropout if config.num_layers > 1 else 0,
             batch_first=True
         )
         
-        self.dropout = nn.Dropout(dropout)
-        
+        # Output projection with gating
+        self.output_projection = nn.Sequential(
+            nn.Linear(config.hidden_dim, config.hidden_dim),
+            nn.LayerNorm(config.hidden_dim) if config.use_layer_norm else nn.Identity(),
+            nn.ReLU(),
+            nn.Dropout(config.dropout)
+        )
+        self.gate = nn.Sequential(
+            nn.Linear(config.hidden_dim, config.hidden_dim),
+            nn.Sigmoid()
+        )
+    
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Multi-scale feature extraction
-        scale_features = []
-        for scale_embed in self.scale_embeddings:
-            scale_features.append(scale_embed(x))
+        # Character embedding with position encoding
+        embedded = self.char_embedding(x)
+        embedded = self.pos_encoding(embedded)
         
-        # Dynamic feature fusion
-        weights = F.softmax(self.fusion_weights, dim=0)
-        fused_features = sum(w * f for w, f in zip(weights, scale_features))
+        # Multi-scale feature extraction
+        conv_features = []
+        for conv_layer in self.conv_layers:
+            # Reshape for convolution
+            conv_input = embedded.transpose(1, 2)
+            # Apply convolution
+            conv_output = conv_layer(conv_input)
+            # Reshape back
+            conv_features.append(conv_output.transpose(1, 2))
+        
+        # Feature fusion with attention
+        fused_features = torch.stack(conv_features, dim=0)
+        fused_features, _ = self.fusion_attention(
+            fused_features, fused_features, fused_features
+        )
+        fused_features = fused_features.mean(dim=0)
         
         # Bidirectional processing
-        forward_out, forward_hidden = self.forward_gru(fused_features)
-        backward_out, backward_hidden = self.backward_gru(fused_features.flip(1))
+        forward_out, (forward_h, forward_c) = self.forward_lstm(fused_features)
+        backward_out, (backward_h, backward_c) = self.backward_lstm(fused_features.flip(1))
         
         # Combine forward and backward
         combined_out = torch.cat([forward_out, backward_out], dim=-1)
-        combined_hidden = torch.cat([forward_hidden, backward_hidden], dim=-1)
+        combined_h = torch.cat([forward_h, backward_h], dim=-1)
+        combined_c = torch.cat([forward_c, backward_c], dim=-1)
         
-        return combined_out, combined_hidden
+        # Output projection with gating
+        projected = self.output_projection(combined_out)
+        gate = self.gate(combined_out)
+        output = projected * gate + combined_out * (1 - gate)
+        
+        return output, (combined_h, combined_c)
+
+class PositionalEncoding(nn.Module):
+    """Positional encoding for sequence processing"""
+    def __init__(self, d_model: int, max_len: int = 5000):
+        super().__init__()
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(max_len, 1, d_model)
+        pe[:, 0, 0::2] = torch.sin(position * div_term)
+        pe[:, 0, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.pe[:x.size(0)]
 
 class AdaptiveAttention(nn.Module):
-    """Adaptive attention mechanism with dynamic scoring"""
-    def __init__(self, hidden_dim: int):
+    """Adaptive attention with dynamic scoring"""
+    def __init__(self, config: ModelConfig):
         super().__init__()
-        self.hidden_dim = hidden_dim
+        self.config = config
+        self.head_dim = config.hidden_dim // config.attention_heads
         
-        # Dynamic scoring components
-        self.query_transform = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh()
-        )
-        self.key_transform = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh()
-        )
+        # Query, Key, Value projections
+        self.q_proj = nn.Linear(config.hidden_dim, config.hidden_dim)
+        self.k_proj = nn.Linear(config.hidden_dim, config.hidden_dim)
+        self.v_proj = nn.Linear(config.hidden_dim, config.hidden_dim)
         
-        # Adaptive scoring
+        # Output projection
+        self.out_proj = nn.Linear(config.hidden_dim, config.hidden_dim)
+        
+        # Scoring functions
         self.scoring_weights = nn.Parameter(torch.ones(3) / 3)
         
-    def forward(self, 
-                query: torch.Tensor,
-                key: torch.Tensor,
-                value: torch.Tensor,
-                mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Transform query and key
-        query = self.query_transform(query)
-        key = self.key_transform(key)
+        # Layer normalization
+        self.layer_norm = nn.LayerNorm(config.hidden_dim) if config.use_layer_norm else nn.Identity()
         
-        # Multiple scoring functions
+        # Attention dropout
+        self.attention_dropout = nn.Dropout(config.dropout)
+    
+    def _compute_scores(self, query: torch.Tensor, key: torch.Tensor) -> torch.Tensor:
+        """Compute attention scores using multiple scoring functions"""
+        # Reshape for multi-head processing
+        batch_size = query.size(0)
+        query = query.view(batch_size, -1, self.config.attention_heads, self.head_dim)
+        key = key.view(batch_size, -1, self.config.attention_heads, self.head_dim)
+        
+        # Compute different scoring functions
         dot_score = torch.matmul(query, key.transpose(-2, -1))
         cosine_score = F.cosine_similarity(query.unsqueeze(-2), key.unsqueeze(-3), dim=-1)
         euclidean_score = -torch.cdist(query, key)
@@ -100,98 +168,120 @@ class AdaptiveAttention(nn.Module):
                  weights[1] * cosine_score + 
                  weights[2] * euclidean_score)
         
+        return scores
+    
+    def forward(self, 
+                query: torch.Tensor,
+                key: torch.Tensor,
+                value: torch.Tensor,
+                mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Project inputs
+        q = self.q_proj(query)
+        k = self.k_proj(key)
+        v = self.v_proj(value)
+        
+        # Compute attention scores
+        scores = self._compute_scores(q, k)
+        
         if mask is not None:
             scores = scores.masked_fill(mask == 0, float('-inf'))
         
+        # Apply softmax and dropout
         attention_weights = F.softmax(scores, dim=-1)
-        context = torch.matmul(attention_weights, value)
+        attention_weights = self.attention_dropout(attention_weights)
         
-        return context, attention_weights
-
-class MultiScaleDecoder(nn.Module):
-    """Multi-scale decoder with adaptive attention"""
-    def __init__(self, 
-                 output_dim: int,
-                 hidden_dim: int,
-                 num_layers: int = 2,
-                 dropout: float = 0.1):
-        super().__init__()
-        self.output_dim = output_dim
-        self.hidden_dim = hidden_dim
+        # Compute weighted sum
+        context = torch.matmul(attention_weights, v)
         
-        # Multi-scale processing
-        self.scale_projections = nn.ModuleList([
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.Linear(hidden_dim, hidden_dim // 4),
-            nn.Linear(hidden_dim, hidden_dim // 8)
-        ])
+        # Project output
+        output = self.out_proj(context)
         
-        # Adaptive attention
-        self.attention = AdaptiveAttention(hidden_dim)
-        
-        # Decoder GRU
-        self.gru = nn.GRU(
-            hidden_dim + output_dim, hidden_dim,
-            num_layers=num_layers,
-            dropout=dropout if num_layers > 1 else 0,
-            batch_first=True
-        )
-        
-        # Output projection
-        self.output = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, output_dim)
-        )
-        
-        self.dropout = nn.Dropout(dropout)
-        
-    def forward(self, 
-                x: torch.Tensor,
-                encoder_output: torch.Tensor,
-                encoder_hidden: torch.Tensor,
-                mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Multi-scale processing
-        scale_features = []
-        for scale_proj in self.scale_projections:
-            scale_features.append(scale_proj(encoder_hidden[-1].unsqueeze(1)))
-        
-        # Combine scale features
-        combined_features = torch.cat(scale_features, dim=-1)
-        
-        # Attention
-        context, attention_weights = self.attention(
-            combined_features,
-            encoder_output,
-            encoder_output,
-            mask
-        )
-        
-        # Decode
-        decoder_input = torch.cat([x, context], dim=-1)
-        output, _ = self.gru(decoder_input)
-        
-        # Project to output
-        output = self.output(output)
+        # Apply residual connection and layer normalization
+        if self.config.use_residual:
+            output = self.layer_norm(output + query)
+        else:
+            output = self.layer_norm(output)
         
         return output, attention_weights
 
-class MultiScaleSeq2Seq(nn.Module):
-    """Multi-scale sequence-to-sequence model"""
-    def __init__(self, 
-                 input_dim: int,
-                 output_dim: int,
-                 hidden_dim: int,
-                 num_layers: int = 2,
-                 dropout: float = 0.1):
+class MultiScaleDecoder(nn.Module):
+    """Multi-scale decoder with adaptive attention"""
+    def __init__(self, config: ModelConfig):
         super().__init__()
-        self.encoder = MultiScaleEncoder(
-            input_dim, hidden_dim, num_layers, dropout
-        )
-        self.decoder = MultiScaleDecoder(
-            output_dim, hidden_dim, num_layers, dropout
+        self.config = config
+        
+        # Character embedding with position encoding
+        self.char_embedding = nn.Embedding(config.output_dim, config.hidden_dim)
+        self.pos_encoding = PositionalEncoding(config.hidden_dim, config.max_sequence_length)
+        
+        # Adaptive attention
+        self.self_attention = AdaptiveAttention(config)
+        self.cross_attention = AdaptiveAttention(config)
+        
+        # LSTM decoder
+        self.lstm = nn.LSTM(
+            config.hidden_dim * 2,  # Input + attention context
+            config.hidden_dim,
+            num_layers=config.num_layers,
+            dropout=config.dropout if config.num_layers > 1 else 0,
+            batch_first=True
         )
         
+        # Output projection with gating
+        self.output_projection = nn.Sequential(
+            nn.Linear(config.hidden_dim, config.hidden_dim),
+            nn.LayerNorm(config.hidden_dim) if config.use_layer_norm else nn.Identity(),
+            nn.ReLU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.hidden_dim, config.output_dim)
+        )
+        self.gate = nn.Sequential(
+            nn.Linear(config.hidden_dim, config.hidden_dim),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, 
+                x: torch.Tensor,
+                encoder_output: torch.Tensor,
+                encoder_hidden: Tuple[torch.Tensor, torch.Tensor],
+                mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Character embedding with position encoding
+        embedded = self.char_embedding(x)
+        embedded = self.pos_encoding(embedded)
+        
+        # Self-attention
+        self_attn_out, _ = self.self_attention(embedded, embedded, embedded)
+        
+        # Cross-attention
+        cross_attn_out, attention_weights = self.cross_attention(
+            self_attn_out, encoder_output, encoder_output, mask
+        )
+        
+        # Combine attention outputs
+        combined = torch.cat([self_attn_out, cross_attn_out], dim=-1)
+        
+        # LSTM processing
+        lstm_out, _ = self.lstm(combined, encoder_hidden)
+        
+        # Output projection with gating
+        projected = self.output_projection(lstm_out)
+        gate = self.gate(lstm_out)
+        output = projected * gate + lstm_out * (1 - gate)
+        
+        return output, attention_weights
+
+class NeuralTransliterator(nn.Module):
+    """Neural transliteration model with multi-scale processing"""
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.config = config
+        
+        # Encoder
+        self.encoder = MultiScaleEncoder(config)
+        
+        # Decoder
+        self.decoder = MultiScaleDecoder(config)
+    
     def forward(self, 
                 source: torch.Tensor,
                 target: torch.Tensor,
@@ -211,6 +301,7 @@ class MultiScaleSeq2Seq(nn.Module):
                 source: torch.Tensor,
                 max_length: int,
                 device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Generate output sequence using beam search"""
         batch_size = source.size(0)
         
         # Encode
