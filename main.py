@@ -1,129 +1,115 @@
 import torch
-import torch.nn as nn
-import wandb
-import argparse
 import logging
+import argparse
 from pathlib import Path
 
-from models import CustomEncoder, CustomDecoder, CustomSeq2Seq
-from data_utils import create_dataloaders
-from train_utils import ModelTrainer, ModelEvaluator
+# Renamed module imports
+from data_processing import prepare_datasets
+from model_components import TextEncoder, TextDecoder, SequenceConverter
+from training_helpers import ModelRunner, AccuracyCalculator
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+log = logging.getLogger('train')
 
-def parse_args():
-    parser = argparse.ArgumentParser(description='Train a sequence-to-sequence model for transliteration')
+def setup_arguments():
+    parser = argparse.ArgumentParser(prog='Seq2Seq Trainer')
     
-    # Data arguments
-    parser.add_argument('--train_file', type=str, required=True, help='Path to training data file')
-    parser.add_argument('--val_file', type=str, required=True, help='Path to validation data file')
-    parser.add_argument('--test_file', type=str, required=True, help='Path to test data file')
+    # Data configuration
+    parser.add_argument('-train', required=True, help='Training data path')
+    parser.add_argument('-val', required=True, help='Validation data path')
+    parser.add_argument('-test', required=True, help='Testing data path')
     
-    # Model arguments
-    parser.add_argument('--embed_dim', type=int, default=256, help='Embedding dimension')
-    parser.add_argument('--hidden_dim', type=int, default=512, help='Hidden dimension')
-    parser.add_argument('--num_layers', type=int, default=2, help='Number of RNN layers')
-    parser.add_argument('--rnn_type', type=str, default='LSTM', choices=['LSTM', 'GRU', 'RNN'], help='Type of RNN')
-    parser.add_argument('--dropout', type=float, default=0.3, help='Dropout rate')
+    # Model configuration
+    parser.add_argument('-emb', type=int, default=256, help='Embedding size')
+    parser.add_argument('-hid', type=int, default=512, help='Hidden layer size')
+    parser.add_argument('-layers', type=int, default=2, help='RNN depth')
+    parser.add_argument('-cell', choices=['lstm','gru','rnn'], default='lstm')
+    parser.add_argument('-drop', type=float, default=0.3, help='Regularization')
     
-    # Training arguments
-    parser.add_argument('--batch_size', type=int, default=32, help='Batch size')
-    parser.add_argument('--num_epochs', type=int, default=20, help='Number of epochs')
-    parser.add_argument('--learning_rate', type=float, default=0.001, help='Learning rate')
-    parser.add_argument('--max_len', type=int, default=50, help='Maximum sequence length')
-    parser.add_argument('--min_freq', type=int, default=1, help='Minimum character frequency')
+    # Training configuration
+    parser.add_argument('-bsize', type=int, default=32, help='Samples per batch')
+    parser.add_argument('-epochs', type=int, default=20, help='Training cycles')
+    parser.add_argument('-lr', type=float, default=0.001, help='Step size')
+    parser.add_argument('-maxlen', type=int, default=50, help='Sequence limit')
+    parser.add_argument('-mincount', type=int, default=1, help='Char frequency')
     
-    # Wandb arguments
-    parser.add_argument('--wandb_project', type=str, default='transliteration', help='Wandb project name')
-    parser.add_argument('--wandb_entity', type=str, default=None, help='Wandb entity name')
-    
-    # Other arguments
-    parser.add_argument('--save_dir', type=str, default='checkpoints', help='Directory to save model checkpoints')
-    parser.add_argument('--seed', type=int, default=42, help='Random seed')
+    # Logging and saving
+    parser.add_argument('-wandb', action='store_true', help='Enable monitoring')
+    parser.add_argument('-save', default='models', help='Checkpoint directory')
+    parser.add_argument('-seed', type=int, default=42, help='Random seed')
     
     return parser.parse_args()
 
-def main():
-    # Parse arguments
-    args = parse_args()
-    
-    # Set random seed
-    torch.manual_seed(args.seed)
+def configure_environment(seed):
+    torch.manual_seed(seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed(args.seed)
-    
-    # Set device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    logger.info(f"Using device: {device}")
-    
-    # Create save directory
-    save_dir = Path(args.save_dir)
-    save_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Initialize wandb
-    if args.wandb_entity:
-        wandb.init(
-            project=args.wandb_project,
-            entity=args.wandb_entity,
-            config=vars(args)
-        )
-    
-    # Create dataloaders
-    train_loader, val_loader, test_loader, source_vocab, target_vocab = create_dataloaders(
-        args.train_file,
-        args.val_file,
-        args.test_file,
-        batch_size=args.batch_size,
-        max_len=args.max_len,
-        min_freq=args.min_freq
+        torch.cuda.manual_seed(seed)
+    return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+def initialize_model(args, src_vocab, tgt_vocab, device):
+    encoder = TextEncoder(
+        vocab_size=len(src_vocab.char2idx),
+        emb_size=args.emb,
+        hidden_size=args.hid,
+        num_layers=args.layers,
+        cell_type=args.cell,
+        dropout=args.drop
     )
     
-    # Create model
-    encoder = CustomEncoder(
-        vocab_size=len(source_vocab.char2idx),
-        embed_dim=args.embed_dim,
-        hidden_dim=args.hidden_dim,
-        num_layers=args.num_layers,
-        rnn_type=args.rnn_type,
-        dropout=args.dropout
+    decoder = TextDecoder(
+        vocab_size=len(tgt_vocab.char2idx),
+        emb_size=args.emb,
+        hidden_size=args.hid,
+        num_layers=args.layers,
+        cell_type=args.cell,
+        dropout=args.drop
     )
     
-    decoder = CustomDecoder(
-        vocab_size=len(target_vocab.char2idx),
-        embed_dim=args.embed_dim,
-        hidden_dim=args.hidden_dim,
-        num_layers=args.num_layers,
-        rnn_type=args.rnn_type,
-        dropout=args.dropout
+    return SequenceConverter(encoder, decoder, device).to(device)
+
+def execute_training():
+    params = setup_arguments()
+    device = configure_environment(params.seed)
+    Path(params.save).mkdir(exist_ok=True)
+    
+    if params.wandb:
+        import wandb
+        wandb.init(project='seq2seq-transliterate', config=vars(params))
+    
+    # Data preparation
+    train_iter, val_iter, test_iter, src_vocab, tgt_vocab = prepare_datasets(
+        params.train, params.val, params.test,
+        batch_size=params.bsize,
+        max_length=params.maxlen,
+        min_count=params.mincount
     )
     
-    model = CustomSeq2Seq(encoder, decoder, device).to(device)
+    # Model initialization
+    seq_model = initialize_model(params, src_vocab, tgt_vocab, device)
     
-    # Create trainer
-    trainer = ModelTrainer(
-        model=model,
+    # Training execution
+    trainer = ModelRunner(
+        model=seq_model,
         device=device,
-        optimizer=torch.optim.Adam(model.parameters(), lr=args.learning_rate)
+        optimizer=torch.optim.Adam(seq_model.parameters(), lr=params.lr)
     )
     
-    # Train model
-    trainer.train(
-        train_loader=train_loader,
-        val_loader=val_loader,
-        num_epochs=args.num_epochs,
-        save_path=save_dir / 'best_model.pt',
-        wandb_config=wandb.config if args.wandb_entity else None
+    best_model_path = Path(params.save)/'model.pt'
+    trainer.fit(
+        train_iter, val_iter,
+        num_epochs=params.epochs,
+        checkpoint_path=best_model_path,
+        use_wandb=params.wandb
     )
     
-    # Evaluate model
-    evaluator = ModelEvaluator(model, device, target_vocab)
-    test_accuracy = evaluator.calculate_accuracy(test_loader)
-    logger.info(f"Test accuracy: {test_accuracy:.4f}")
+    # Final evaluation
+    evaluator = AccuracyCalculator(seq_model, device, tgt_vocab)
+    final_acc = evaluator.measure(test_iter)
+    log.info(f"Final Test Score: {final_acc:.2%}")
     
-    if args.wandb_entity:
-        wandb.log({"test_accuracy": test_accuracy})
+    if params.wandb:
+        wandb.log({"final_accuracy": final_acc})
         wandb.finish()
 
 if __name__ == '__main__':
-    main()
+    execute_training()

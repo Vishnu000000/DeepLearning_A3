@@ -2,327 +2,196 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from typing import Optional, Tuple, Dict, List
-from dataclasses import dataclass
 
-@dataclass
-class ModelConfig:
-    """Configuration for the neural transliteration model"""
-    input_dim: int
-    output_dim: int
-    hidden_dim: int = 512
-    num_layers: int = 3
-    dropout: float = 0.2
-    attention_heads: int = 4
-    use_layer_norm: bool = True
-    use_residual: bool = True
-    max_sequence_length: int = 100
-    use_convolution: bool = True
-    use_transformer: bool = True
-    use_lstm: bool = True
+class ModelParams:
+    def __init__(self, vocab_size, target_size):
+        self.embed_size = 256
+        self.latent_size = 512
+        self.depth = 3
+        self.drop_prob = 0.2
+        self.head_count = 4
+        self.max_seq = 100
+        self.enable_skip = True
+        self.use_norm = True
 
-class MultiScaleEncoder(nn.Module):
-    """Multi-scale encoder with dynamic feature extraction"""
-    def __init__(self, config: ModelConfig):
+class HierarchicalEncoder(nn.Module):
+    def __init__(self, params):
         super().__init__()
-        self.config = config
+        self.params = params
         
-        # Character embedding with position encoding
-        self.char_embedding = nn.Embedding(config.input_dim, config.hidden_dim)
-        self.pos_encoding = PositionalEncoding(config.hidden_dim, config.max_sequence_length)
+        self.embed = nn.Embedding(params.vocab_size, params.embed_size)
+        self.pos_embed = PositionEmbedder(params.embed_size, params.max_seq)
         
-        # Multi-scale feature extraction
-        self.conv_layers = nn.ModuleList([
+        self.feature_extractors = nn.ModuleList([
             nn.Sequential(
-                nn.Conv1d(config.hidden_dim, config.hidden_dim // 2, kernel_size=k),
-                nn.BatchNorm1d(config.hidden_dim // 2),
-                nn.ReLU(),
-                nn.Dropout(config.dropout)
-            ) for k in [2, 3, 4]
+                nn.Conv1d(params.embed_size, params.embed_size//2, k),
+                nn.GroupNorm(1, params.embed_size//2),
+                nn.GELU(),
+                nn.Dropout(params.drop_prob)
+            ) for k in [2,3,5]
         ])
         
-        # Feature fusion with attention
-        self.fusion_attention = nn.MultiheadAttention(
-            config.hidden_dim // 2,
-            num_heads=config.attention_heads,
-            dropout=config.dropout
+        self.feature_merger = nn.MultiheadAttention(
+            params.embed_size//2, params.head_count, params.drop_prob
         )
         
-        # Bidirectional processing
-        self.forward_lstm = nn.LSTM(
-            config.hidden_dim, config.hidden_dim // 2,
-            num_layers=config.num_layers,
-            dropout=config.dropout if config.num_layers > 1 else 0,
-            batch_first=True
-        )
-        self.backward_lstm = nn.LSTM(
-            config.hidden_dim, config.hidden_dim // 2,
-            num_layers=config.num_layers,
-            dropout=config.dropout if config.num_layers > 1 else 0,
+        self.seq_processor = nn.LSTM(
+            params.embed_size, params.latent_size//2,
+            num_layers=params.depth,
+            dropout=params.drop_prob,
+            bidirectional=True,
             batch_first=True
         )
         
-        # Output projection with gating
-        self.output_projection = nn.Sequential(
-            nn.Linear(config.hidden_dim, config.hidden_dim),
-            nn.LayerNorm(config.hidden_dim) if config.use_layer_norm else nn.Identity(),
-            nn.ReLU(),
-            nn.Dropout(config.dropout)
+        self.transform = nn.Sequential(
+            nn.Linear(params.latent_size, params.latent_size),
+            nn.LayerNorm(params.latent_size) if params.use_norm else nn.Identity(),
+            nn.SiLU(),
+            nn.Dropout(params.drop_prob)
         )
-        self.gate = nn.Sequential(
-            nn.Linear(config.hidden_dim, config.hidden_dim),
-            nn.Sigmoid()
-        )
-    
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Character embedding with position encoding
-        embedded = self.char_embedding(x)
-        embedded = self.pos_encoding(embedded)
-        
-        # Multi-scale feature extraction
-        conv_features = []
-        for conv_layer in self.conv_layers:
-            # Reshape for convolution
-            conv_input = embedded.transpose(1, 2)
-            # Apply convolution
-            conv_output = conv_layer(conv_input)
-            # Reshape back
-            conv_features.append(conv_output.transpose(1, 2))
-        
-        # Feature fusion with attention
-        fused_features = torch.stack(conv_features, dim=0)
-        fused_features, _ = self.fusion_attention(
-            fused_features, fused_features, fused_features
-        )
-        fused_features = fused_features.mean(dim=0)
-        
-        # Bidirectional processing
-        forward_out, (forward_h, forward_c) = self.forward_lstm(fused_features)
-        backward_out, (backward_h, backward_c) = self.backward_lstm(fused_features.flip(1))
-        
-        # Combine forward and backward
-        combined_out = torch.cat([forward_out, backward_out], dim=-1)
-        combined_h = torch.cat([forward_h, backward_h], dim=-1)
-        combined_c = torch.cat([forward_c, backward_c], dim=-1)
-        
-        # Output projection with gating
-        projected = self.output_projection(combined_out)
-        gate = self.gate(combined_out)
-        output = projected * gate + combined_out * (1 - gate)
-        
-        return output, (combined_h, combined_c)
+        self.merge_gate = nn.Linear(params.latent_size, params.latent_size)
 
-class PositionalEncoding(nn.Module):
-    """Positional encoding for sequence processing"""
-    def __init__(self, d_model: int, max_len: int = 5000):
+    def process(self, x):
+        emb = self.embed(x)
+        emb = self.pos_embed(emb)
+        
+        conv_features = []
+        for extractor in self.feature_extractors:
+            feat = extractor(emb.permute(0,2,1)).permute(0,2,1)
+            conv_features.append(feat)
+        
+        merged, _ = self.feature_merger(
+            torch.stack(conv_features), 
+            torch.stack(conv_features),
+            torch.stack(conv_features)
+        )
+        merged = merged.mean(0)
+        
+        processed, (h, c) = self.seq_processor(merged)
+        
+        transformed = self.transform(processed)
+        gate = torch.sigmoid(self.merge_gate(processed))
+        return transformed*gate + processed*(1-gate), (h,c)
+
+class PositionEmbedder(nn.Module):
+    def __init__(self, dim, max_len=5000):
         super().__init__()
-        position = torch.arange(max_len).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
-        pe = torch.zeros(max_len, 1, d_model)
-        pe[:, 0, 0::2] = torch.sin(position * div_term)
-        pe[:, 0, 1::2] = torch.cos(position * div_term)
+        pos = torch.arange(max_len).unsqueeze(1)
+        div = torch.exp(torch.arange(0, dim, 2)*(-math.log(100)/dim))
+        pe = torch.zeros(max_len, 1, dim)
+        pe[...,0::2] = torch.sin(pos*div)
+        pe[...,1::2] = torch.cos(pos*div)
         self.register_buffer('pe', pe)
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.pe[:x.size(0)]
+    def forward(self, x):
+        return x + self.pe[:x.size(1)]
 
-class AdaptiveAttention(nn.Module):
-    """Adaptive attention with dynamic scoring"""
-    def __init__(self, config: ModelConfig):
+class DynamicFocus(nn.Module):
+    def __init__(self, params):
         super().__init__()
-        self.config = config
-        self.head_dim = config.hidden_dim // config.attention_heads
+        self.dim = params.latent_size
+        self.heads = params.head_count
+        self.head_dim = self.dim // self.heads
         
-        # Query, Key, Value projections
-        self.q_proj = nn.Linear(config.hidden_dim, config.hidden_dim)
-        self.k_proj = nn.Linear(config.hidden_dim, config.hidden_dim)
-        self.v_proj = nn.Linear(config.hidden_dim, config.hidden_dim)
+        self.query = nn.Linear(self.dim, self.dim)
+        self.key = nn.Linear(self.dim, self.dim)
+        self.value = nn.Linear(self.dim, self.dim)
+        self.out = nn.Linear(self.dim, self.dim)
         
-        # Output projection
-        self.out_proj = nn.Linear(config.hidden_dim, config.hidden_dim)
+        self.score_weights = nn.Parameter(torch.ones(3))
+        self.norm = nn.LayerNorm(self.dim) if params.use_norm else nn.Identity()
+        self.drop = nn.Dropout(params.drop_prob)
+
+    def compute_attention(self, q, k, v, mask=None):
+        b, t, _ = q.size()
+        q = q.view(b, t, self.heads, self.head_dim)
+        k = k.view(b, t, self.heads, self.head_dim)
         
-        # Scoring functions
-        self.scoring_weights = nn.Parameter(torch.ones(3) / 3)
+        dot = (q @ k.transpose(-2,-1)) / math.sqrt(self.head_dim)
+        cos = F.cosine_similarity(q.unsqueeze(-2), k.unsqueeze(-3), dim=-1)
+        dist = -torch.cdist(q, k)
         
-        # Layer normalization
-        self.layer_norm = nn.LayerNorm(config.hidden_dim) if config.use_layer_norm else nn.Identity()
-        
-        # Attention dropout
-        self.attention_dropout = nn.Dropout(config.dropout)
-    
-    def _compute_scores(self, query: torch.Tensor, key: torch.Tensor) -> torch.Tensor:
-        """Compute attention scores using multiple scoring functions"""
-        # Reshape for multi-head processing
-        batch_size = query.size(0)
-        query = query.view(batch_size, -1, self.config.attention_heads, self.head_dim)
-        key = key.view(batch_size, -1, self.config.attention_heads, self.head_dim)
-        
-        # Compute different scoring functions
-        dot_score = torch.matmul(query, key.transpose(-2, -1))
-        cosine_score = F.cosine_similarity(query.unsqueeze(-2), key.unsqueeze(-3), dim=-1)
-        euclidean_score = -torch.cdist(query, key)
-        
-        # Combine scores with learned weights
-        weights = F.softmax(self.scoring_weights, dim=0)
-        scores = (weights[0] * dot_score + 
-                 weights[1] * cosine_score + 
-                 weights[2] * euclidean_score)
-        
-        return scores
-    
-    def forward(self, 
-                query: torch.Tensor,
-                key: torch.Tensor,
-                value: torch.Tensor,
-                mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Project inputs
-        q = self.q_proj(query)
-        k = self.k_proj(key)
-        v = self.v_proj(value)
-        
-        # Compute attention scores
-        scores = self._compute_scores(q, k)
+        weights = F.softmax(self.score_weights, 0)
+        scores = weights[0]*dot + weights[1]*cos + weights[2]*dist
         
         if mask is not None:
-            scores = scores.masked_fill(mask == 0, float('-inf'))
+            scores = scores.masked_fill(~mask, -1e9)
+            
+        attn = F.softmax(scores, -1)
+        attn = self.drop(attn)
         
-        # Apply softmax and dropout
-        attention_weights = F.softmax(scores, dim=-1)
-        attention_weights = self.attention_dropout(attention_weights)
-        
-        # Compute weighted sum
-        context = torch.matmul(attention_weights, v)
-        
-        # Project output
-        output = self.out_proj(context)
-        
-        # Apply residual connection and layer normalization
-        if self.config.use_residual:
-            output = self.layer_norm(output + query)
-        else:
-            output = self.layer_norm(output)
-        
-        return output, attention_weights
+        output = (attn @ v).reshape(b, t, self.dim)
+        return self.out(output), attn
 
-class MultiScaleDecoder(nn.Module):
-    """Multi-scale decoder with adaptive attention"""
-    def __init__(self, config: ModelConfig):
+    def forward(self, q, k, v, mask=None):
+        q_proj = self.query(q)
+        k_proj = self.key(k)
+        v_proj = self.value(v)
+        
+        result, attn = self.compute_attention(q_proj, k_proj, v_proj, mask)
+        if self.params.enable_skip:
+            result = result + q
+        return self.norm(result), attn
+
+class SequenceGenerator(nn.Module):
+    def __init__(self, params):
         super().__init__()
-        self.config = config
+        self.params = params
         
-        # Character embedding with position encoding
-        self.char_embedding = nn.Embedding(config.output_dim, config.hidden_dim)
-        self.pos_encoding = PositionalEncoding(config.hidden_dim, config.max_sequence_length)
+        self.embed = nn.Embedding(params.target_size, params.embed_size)
+        self.pos_embed = PositionEmbedder(params.embed_size, params.max_seq)
         
-        # Adaptive attention
-        self.self_attention = AdaptiveAttention(config)
-        self.cross_attention = AdaptiveAttention(config)
+        self.self_focus = DynamicFocus(params)
+        self.cross_focus = DynamicFocus(params)
         
-        # LSTM decoder
-        self.lstm = nn.LSTM(
-            config.hidden_dim * 2,  # Input + attention context
-            config.hidden_dim,
-            num_layers=config.num_layers,
-            dropout=config.dropout if config.num_layers > 1 else 0,
+        self.seq_cell = nn.LSTM(
+            params.embed_size + params.latent_size,
+            params.latent_size,
+            num_layers=params.depth,
+            dropout=params.drop_prob,
             batch_first=True
         )
         
-        # Output projection with gating
-        self.output_projection = nn.Sequential(
-            nn.Linear(config.hidden_dim, config.hidden_dim),
-            nn.LayerNorm(config.hidden_dim) if config.use_layer_norm else nn.Identity(),
-            nn.ReLU(),
-            nn.Dropout(config.dropout),
-            nn.Linear(config.hidden_dim, config.output_dim)
+        self.output_layer = nn.Sequential(
+            nn.Linear(params.latent_size, params.latent_size),
+            nn.LayerNorm(params.latent_size) if params.use_norm else nn.Identity(),
+            nn.ELU(),
+            nn.Dropout(params.drop_prob),
+            nn.Linear(params.latent_size, params.target_size)
         )
-        self.gate = nn.Sequential(
-            nn.Linear(config.hidden_dim, config.hidden_dim),
-            nn.Sigmoid()
-        )
-    
-    def forward(self, 
-                x: torch.Tensor,
-                encoder_output: torch.Tensor,
-                encoder_hidden: Tuple[torch.Tensor, torch.Tensor],
-                mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Character embedding with position encoding
-        embedded = self.char_embedding(x)
-        embedded = self.pos_encoding(embedded)
-        
-        # Self-attention
-        self_attn_out, _ = self.self_attention(embedded, embedded, embedded)
-        
-        # Cross-attention
-        cross_attn_out, attention_weights = self.cross_attention(
-            self_attn_out, encoder_output, encoder_output, mask
-        )
-        
-        # Combine attention outputs
-        combined = torch.cat([self_attn_out, cross_attn_out], dim=-1)
-        
-        # LSTM processing
-        lstm_out, _ = self.lstm(combined, encoder_hidden)
-        
-        # Output projection with gating
-        projected = self.output_projection(lstm_out)
-        gate = self.gate(lstm_out)
-        output = projected * gate + lstm_out * (1 - gate)
-        
-        return output, attention_weights
 
-class NeuralTransliterator(nn.Module):
-    """Neural transliteration model with multi-scale processing"""
-    def __init__(self, config: ModelConfig):
+    def decode_step(self, x, mem, hidden, mask=None):
+        emb = self.pos_embed(self.embed(x))
+        self_attn, _ = self.self_focus(emb, emb, emb)
+        cross_attn, weights = self.cross_focus(self_attn, mem, mem, mask)
+        combined = torch.cat([self_attn, cross_attn], -1)
+        
+        out, hidden = self.seq_cell(combined, hidden)
+        return self.output_layer(out), weights, hidden
+
+class CharTranslator(nn.Module):
+    def __init__(self, params):
         super().__init__()
-        self.config = config
+        self.encoder = HierarchicalEncoder(params)
+        self.decoder = SequenceGenerator(params)
+        self.params = params
+
+    def forward(self, src, tgt, src_mask=None):
+        enc_out, enc_hidden = self.encoder.process(src)
+        dec_out, attn_weights, _ = self.decoder.decode_step(tgt, enc_out, enc_hidden, src_mask)
+        return dec_out, attn_weights
+
+    def predict(self, src, max_len, device):
+        batch_size = src.size(0)
+        enc_out, enc_hidden = self.encoder.process(src)
         
-        # Encoder
-        self.encoder = MultiScaleEncoder(config)
-        
-        # Decoder
-        self.decoder = MultiScaleDecoder(config)
-    
-    def forward(self, 
-                source: torch.Tensor,
-                target: torch.Tensor,
-                source_mask: Optional[torch.Tensor] = None,
-                target_mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Encode
-        encoder_output, encoder_hidden = self.encoder(source)
-        
-        # Decode
-        decoder_output, attention_weights = self.decoder(
-            target, encoder_output, encoder_hidden, source_mask
-        )
-        
-        return decoder_output, attention_weights
-    
-    def generate(self, 
-                source: torch.Tensor,
-                max_length: int,
-                device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Generate output sequence using beam search"""
-        batch_size = source.size(0)
-        
-        # Encode
-        encoder_output, encoder_hidden = self.encoder(source)
-        
-        # Initialize decoder input
-        decoder_input = torch.ones(batch_size, 1, dtype=torch.long, device=device)
-        
-        # Generate
+        tokens = torch.ones(batch_size, 1, dtype=torch.long, device=device)
         outputs = []
-        attention_weights = []
         
-        for _ in range(max_length):
-            decoder_output, attention = self.decoder(
-                decoder_input, encoder_output, encoder_hidden
-            )
+        for _ in range(max_len):
+            logits, attn, enc_hidden = self.decoder.decode_step(
+                tokens[:, -1:], enc_out, enc_hidden)
+            tokens = torch.cat([tokens, logits.argmax(-1)], -1)
+            outputs.append(logits)
             
-            # Get most likely token
-            decoder_input = decoder_output.argmax(dim=-1)
-            
-            outputs.append(decoder_output)
-            attention_weights.append(attention)
-        
-        return torch.cat(outputs, dim=1), torch.cat(attention_weights, dim=1) 
+        return torch.cat(outputs, 1), tokens
