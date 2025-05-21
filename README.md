@@ -4,7 +4,7 @@
 
 This repository contains an end-to-end PyTorch implementation of a sequence-to-sequence (Seq2Seq) model with attention for transliterating between Latin (romanized) and Devanagari scripts (Hindi) using the Google Dakshina dataset. Completed as part of DA6401 Assignment 3.
 
-- **Source:** [Google Dakshina dataset](https://github.com/google-research-datasets/dakshina) (Hindi transliteration subset)
+- **WANDB** [Report](https://api.wandb.ai/links/cs24m022-iit-madras-foundation/94ced026) 
 
 ---
 
