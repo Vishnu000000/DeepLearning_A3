@@ -47,9 +47,7 @@ This repository contains an end-to-end PyTorch implementation of a sequence-to-s
    python src/train.py --config configs/hindi.yml
    ```
 4. **Inference**
-   ```bash
-   python src/infer.py --checkpoint results/best_hindi.pth --input "namaste"
-   ```
+  Done in kaggle
 
 ---
 
